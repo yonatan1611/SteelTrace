@@ -14,12 +14,18 @@
     "prisma:studio": "prisma studio",
     "sql:apply": "tsx --env-file=.env prisma/sql/apply.ts",
     "db:seed": "tsx --env-file=.env -e \"import('./src/db/bootstrapSql').then(async ({createExecutor})=>{const e=await createExecutor();const {seed}=await import('./src/db/seed');console.log(await seed(e));await e.close();})\"",
+    "db:set-demo-passwords": "tsx --env-file=.env scripts/set-demo-passwords.ts",
     "test": "tsx --env-file=.env src/db/integrity.test.ts",
     "test:api": "tsx --env-file=.env src/api/__tests__/task5.test.ts",
     "test:api:task6": "tsx --env-file=.env src/api/__tests__/task6.test.ts",
-    "start": "tsx --env-file=.env src/api/server.ts"
+    "start": "tsx --env-file=.env src/api/server.ts",
+    "dev:api": "tsx watch --env-file=.env src/api/server.ts",
+    "dev:web": "npm run dev --prefix web",
+    "build:web": "npm run build --prefix web",
+    "build:all": "npm run build && npm run build:web"
   },
   "dependencies": {
+    "@fastify/cors": "^11.4.3",
     "@fastify/multipart": "^10.1.9",
     "@prisma/client": "^6.1.0",
     "bcryptjs": "^3.0.3",

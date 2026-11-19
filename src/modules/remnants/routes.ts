@@ -101,30 +101,28 @@ export function registerRemnantRoutes(app: FastifyInstance): void {
     const q = remnantSuggestQuery.parse(request.query);
     const { companyId } = request.tenantContext!;
 
-    const candidates = await withAuthedTenantContext(request, (tx) =>
-      tx.$queryRawUnsafe<{ id: string }[]>(
-        `SELECT id FROM material_units
-          WHERE company_id = $1::uuid AND classification = 'OFFCUT' AND status = 'AVAILABLE'
-            AND spec_compare($2::numeric, $3::rebar_surface_type_enum, upper(trim($4::text)), upper(trim($5::text)),
-                              diameter_mm, surface_type, grade_normalized, standard_normalized) = 'CONFIRMED_MATCH'`,
-        companyId, q.diameterMm, q.surfaceType, q.grade, q.standard ?? null,
+    // One statement, not one round trip per candidate — material_unit_
+    // remaining_length_m is called once per matching row INSIDE this
+    // single query (same pattern as reports/routes.ts and the bundles/
+    // inventory list routes), filtered by the HAVING-equivalent WHERE on
+    // the computed column, rather than fetched row-by-row from Node and
+    // filtered there.
+    const withRemaining = await withAuthedTenantContext(request, (tx) =>
+      tx.$queryRawUnsafe<{ material_unit_id: string; remaining_length_m: string }[]>(
+        `SELECT id AS material_unit_id, remaining_length_m FROM (
+           SELECT id, material_unit_remaining_length_m(company_id, id) AS remaining_length_m
+             FROM material_units
+            WHERE company_id = $1::uuid AND classification = 'OFFCUT' AND status = 'AVAILABLE'
+              AND spec_compare($2::numeric, $3::rebar_surface_type_enum, upper(trim($4::text)), upper(trim($5::text)),
+                                diameter_mm, surface_type, grade_normalized, standard_normalized) = 'CONFIRMED_MATCH'
+         ) sized
+         WHERE remaining_length_m >= $6::numeric
+         ORDER BY remaining_length_m ASC
+         LIMIT $7::int`,
+        companyId, q.diameterMm, q.surfaceType, q.grade, q.standard ?? null, q.minLengthM, q.limit,
       ),
     );
 
-    // Sequential — remaining() is per-unit, no shared-tx Promise.all.
-    const withRemaining = await withAuthedTenantContext(request, async (tx) => {
-      const result: { materialUnitId: string; remainingLengthM: number }[] = [];
-      for (const c of candidates) {
-        const remRows = await tx.$queryRawUnsafe<{ r: string }[]>(`SELECT material_unit_remaining_length_m($1::uuid, $2::uuid) AS r`, companyId, c.id);
-        const remaining = Number(remRows[0]!.r);
-        if (remaining >= q.minLengthM) {
-          result.push({ materialUnitId: c.id, remainingLengthM: remaining });
-        }
-      }
-      return result;
-    });
-
-    withRemaining.sort((a, b) => a.remainingLengthM - b.remainingLengthM);
-    return withRemaining.slice(0, q.limit);
+    return withRemaining.map((r) => ({ materialUnitId: r.material_unit_id, remainingLengthM: Number(r.remaining_length_m) }));
   });
 }

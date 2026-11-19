@@ -1,0 +1,24 @@
+@import "tailwindcss";
+
+:root {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, "Segoe UI", Roboto, sans-serif;
+}
+
+#root {
+  min-height: 100svh;
+}
+
+/* Every data table across the app renders bare <td>/<th> with only a
+   first/last-column pl-4/pr-4 — columns in between had no gap at all and
+   visually ran together (e.g. "ROLLING MARGIN (KG)STATUS"). A single base
+   rule here is simpler and more consistent than adding px-* to every cell
+   in every page. */
+table td,
+table th {
+  padding-right: 0.875rem;
+}

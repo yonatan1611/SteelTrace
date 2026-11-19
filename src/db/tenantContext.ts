@@ -69,7 +69,17 @@ function sleep(ms: number): Promise<void> {
 // per-route, since "a write took unexpectedly long" should fail loudly on
 // its own terms (a real DB problem), not be masked by an overly-short
 // transaction window.
-const TRANSACTION_OPTIONS = { timeout: 20_000 };
+//
+// `maxWait` is a SEPARATE Prisma option from `timeout` — it bounds how
+// long $transaction waits to even ACQUIRE a connection before starting,
+// defaulting to 2000ms if left unset. Confirmed firsthand against live
+// Neon (dev server idle long enough for its free-tier compute to auto-
+// suspend): the first request after a suspend has to wait for the compute
+// to wake, which routinely exceeds 2s, and surfaces as "Unable to start a
+// transaction in the given time" — a connection-acquire timeout, not the
+// slow-query timeout `timeout` already guards against. Raised for the
+// same reason as `timeout` above.
+const TRANSACTION_OPTIONS = { timeout: 20_000, maxWait: 20_000 };
 
 async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
   let attempt = 0;

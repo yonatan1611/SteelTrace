@@ -57,44 +57,51 @@ interface BundleRow {
   [key: string]: unknown;
 }
 
-async function bundleRootUnitId(tx: Prisma.TransactionClient, companyId: string, bundleId: string): Promise<string | null> {
-  const rows = await tx.$queryRawUnsafe<{ id: string }[]>(
-    `SELECT id FROM material_units WHERE company_id = $1::uuid AND source_bundle_id = $2::uuid AND granularity = 'BUNDLE'`,
-    companyId,
-    bundleId,
-  );
-  return rows[0]?.id ?? null;
+interface EnrichedBundleRow extends BundleRow {
+  root_material_unit_id: string | null;
+  remaining_length_m: string | null;
+  theoretical_weight_kg: string | null;
+  rolling_margin_kg: string | null;
 }
 
-async function enrichBundle(
-  tx: Prisma.TransactionClient,
-  companyId: string,
-  bundle: BundleRow,
-): Promise<Record<string, unknown>> {
-  const rootUnitId = await bundleRootUnitId(tx, companyId, bundle.id);
-  let remainingLengthM: string | null = null;
-  let theoreticalWeightKg: string | null = null;
-  if (rootUnitId) {
-    // Sequential, not Promise.all: a Prisma interactive-transaction client
-    // holds one physical connection for the whole transaction (required —
-    // the SET LOCAL ROLE/GUCs withTenantContext issued must stay in
-    // effect), and concurrent queries racing over that single connection
-    // is not a safe pattern (observed firsthand: intermittent "Transaction
-    // not found" P2028 errors under concurrent $queryRawUnsafe calls on
-    // the same `tx`).
-    const remRows = await tx.$queryRawUnsafe<{ r: string }[]>(`SELECT material_unit_remaining_length_m($1::uuid, $2::uuid) AS r`, companyId, rootUnitId);
-    const twRows = await tx.$queryRawUnsafe<{ w: string | null }[]>(`SELECT theoretical_weight_kg($1::uuid, $2::uuid) AS w`, companyId, rootUnitId);
-    remainingLengthM = remRows[0]?.r ?? null;
-    theoreticalWeightKg = twRows[0]?.w ?? null;
-  }
-  const marginRows = await tx.$queryRawUnsafe<{ margin: string | null }[]>(`SELECT rolling_margin_kg($1::uuid, $2::uuid) AS margin`, companyId, bundle.id);
+/**
+ * One SQL statement for however many bundles match `extraWhere`, not one
+ * round trip per bundle per figure. `material_unit_remaining_length_m`/
+ * `theoretical_weight_kg`/`rolling_margin_kg` are called once per matching
+ * ROW but all still inside this single query — ordinary server-side SQL
+ * execution, not an extra network round trip — exactly the pattern
+ * reports/routes.ts already documents and relies on. The previous
+ * row-at-a-time version (N sequential $queryRawUnsafe round trips per
+ * bundle, inside one Prisma interactive transaction) is what the fix
+ * replaces: confirmed firsthand against live Neon, GET /api/bundles over
+ * the real 102-bundle opening-stock company reliably exceeded the
+ * transaction's own timeout long before finishing.
+ */
+async function queryEnrichedBundles(tx: Prisma.TransactionClient, companyId: string, extraWhere: string, extraParams: unknown[]): Promise<EnrichedBundleRow[]> {
+  return tx.$queryRawUnsafe<EnrichedBundleRow[]>(
+    `SELECT b.*,
+            mu.id AS root_material_unit_id,
+            material_unit_remaining_length_m(b.company_id, mu.id) AS remaining_length_m,
+            theoretical_weight_kg(b.company_id, mu.id) AS theoretical_weight_kg,
+            rolling_margin_kg(b.company_id, b.id) AS rolling_margin_kg
+       FROM bundles b
+       LEFT JOIN material_units mu
+         ON mu.company_id = b.company_id AND mu.source_bundle_id = b.id AND mu.granularity = 'BUNDLE'
+      WHERE b.company_id = $1::uuid ${extraWhere}
+      ORDER BY b.registered_at DESC`,
+    companyId,
+    ...extraParams,
+  );
+}
 
+function shapeEnrichedBundle(row: EnrichedBundleRow): Record<string, unknown> {
+  const { root_material_unit_id, remaining_length_m, theoretical_weight_kg, rolling_margin_kg, ...bundle } = row;
   return {
     ...bundle,
-    rootMaterialUnitId: rootUnitId,
-    remainingLengthM,
-    theoreticalWeightKg,
-    rollingMarginKg: marginRows[0]?.margin ?? null,
+    rootMaterialUnitId: root_material_unit_id,
+    remainingLengthM: remaining_length_m,
+    theoreticalWeightKg: theoretical_weight_kg,
+    rollingMarginKg: rolling_margin_kg,
   };
 }
 
@@ -145,29 +152,16 @@ export function registerBundleRoutes(app: FastifyInstance): void {
   // -------------------------------------------------------------------------
   app.get("/api/bundles", { preHandler: requireTenantAuth }, async (request) => {
     const { companyId } = request.tenantContext!;
-    const bundles = await withAuthedTenantContext(request, async (tx) => {
-      const rows = await tx.$queryRawUnsafe<BundleRow[]>(`SELECT * FROM bundles WHERE company_id = $1::uuid ORDER BY registered_at DESC`, companyId);
-      // Sequential — see the note in enrichBundle: concurrent queries over
-      // one shared Prisma transaction client are not safe.
-      const enriched: Record<string, unknown>[] = [];
-      for (const b of rows) {
-        enriched.push(await enrichBundle(tx, companyId, b));
-      }
-      return enriched;
-    });
-    return bundles;
+    const rows = await withAuthedTenantContext(request, (tx) => queryEnrichedBundles(tx, companyId, "", []));
+    return rows.map(shapeEnrichedBundle);
   });
 
   app.get<{ Params: { id: string } }>("/api/bundles/:id", { preHandler: requireTenantAuth }, async (request) => {
     const id = z.string().uuid().parse(request.params.id);
     const { companyId } = request.tenantContext!;
-    const bundle = await withAuthedTenantContext(request, async (tx) => {
-      const rows = await tx.$queryRawUnsafe<BundleRow[]>(`SELECT * FROM bundles WHERE company_id = $1::uuid AND id = $2::uuid`, companyId, id);
-      if (!rows[0]) return null;
-      return enrichBundle(tx, companyId, rows[0]);
-    });
-    if (!bundle) throw new NotFoundError("Bundle not found");
-    return bundle;
+    const rows = await withAuthedTenantContext(request, (tx) => queryEnrichedBundles(tx, companyId, "AND b.id = $2::uuid", [id]));
+    if (!rows[0]) throw new NotFoundError("Bundle not found");
+    return shapeEnrichedBundle(rows[0]);
   });
 
   // -------------------------------------------------------------------------

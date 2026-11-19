@@ -65,25 +65,29 @@ export function registerInventoryRoutes(app: FastifyInstance): void {
     params.push(q.limit, q.offset);
 
     return withAuthedTenantContext(request, async (tx: Prisma.TransactionClient) => {
-      const rows = await tx.$queryRawUnsafe<MaterialUnitRow[]>(
-        `SELECT * FROM material_units WHERE ${conditions.join(" AND ")}
+      // One statement, not one round trip per row per figure — calling
+      // material_unit_remaining_length_m/theoretical_weight_kg once per
+      // matching row INSIDE this single query is ordinary server-side SQL
+      // execution, not an extra network round trip (the same pattern
+      // reports/routes.ts documents and relies on). The previous version
+      // issued 2 sequential $queryRawUnsafe round trips per row from Node,
+      // inside one Prisma interactive transaction — confirmed firsthand
+      // against live Neon to reliably exceed the transaction's own
+      // timeout well under the default 200-row page size.
+      const rows = await tx.$queryRawUnsafe<(MaterialUnitRow & { remaining_length_m: string; theoretical_weight_kg: string | null })[]>(
+        `SELECT *,
+                material_unit_remaining_length_m(company_id, id) AS remaining_length_m,
+                theoretical_weight_kg(company_id, id) AS theoretical_weight_kg
+           FROM material_units WHERE ${conditions.join(" AND ")}
           ORDER BY created_at DESC
           LIMIT $${limitParamIndex} OFFSET $${offsetParamIndex}`,
         ...params,
       );
-
-      // Sequential, not Promise.all: a Prisma interactive-transaction
-      // client holds one physical connection for the whole transaction —
-      // concurrent queries racing over it are not a safe pattern
-      // (observed firsthand: intermittent "Transaction not found" P2028
-      // errors under concurrent $queryRawUnsafe calls sharing one `tx`).
-      const enriched: Record<string, unknown>[] = [];
-      for (const u of rows) {
-        const remRows = await tx.$queryRawUnsafe<{ r: string }[]>(`SELECT material_unit_remaining_length_m($1::uuid, $2::uuid) AS r`, companyId, u.id);
-        const twRows = await tx.$queryRawUnsafe<{ w: string | null }[]>(`SELECT theoretical_weight_kg($1::uuid, $2::uuid) AS w`, companyId, u.id);
-        enriched.push({ ...u, remainingLengthM: remRows[0]?.r ?? null, theoreticalWeightKg: twRows[0]?.w ?? null });
-      }
-      return enriched;
+      return rows.map(({ remaining_length_m, theoretical_weight_kg, ...u }) => ({
+        ...u,
+        remainingLengthM: remaining_length_m,
+        theoreticalWeightKg: theoretical_weight_kg,
+      }));
     });
   });
 

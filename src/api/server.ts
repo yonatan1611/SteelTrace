@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from "fastify";
+import cors from "@fastify/cors";
 import { fastifyErrorHandler } from "./errors";
 
 // Defense in depth (Task 6): Postgres `count(*)`/`count(col)` returns
@@ -32,6 +33,11 @@ export function buildServer(): FastifyInstance {
   const app = Fastify({ logger: process.env.NODE_ENV !== "test" });
 
   app.setErrorHandler(fastifyErrorHandler);
+
+  // Vite's dev server proxies /api same-origin (vite.config.ts), so this is
+  // only exercised when the web/ build is served from a different origin
+  // than the API in production.
+  app.register(cors, { origin: true });
 
   app.get("/health", async () => ({ status: "ok" }));
 

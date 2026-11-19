@@ -28,29 +28,70 @@ export function registerReportRoutes(app: FastifyInstance): void {
       const projectFilter = q.projectId ? `AND project_id = $2::uuid` : "";
       const params: unknown[] = q.projectId ? [companyId, q.projectId] : [companyId];
 
+      // total_inventory_kg is deliberately NOT a density-derived theoretical
+      // figure like the other seven buckets below — a bundle's own
+      // actual_weight_kg (ground truth at intake: either the flat
+      // opening-stock figure or the weighbridge-measured GRN figure, §2.13)
+      // IS already a real total-weight number for every bundle, with no
+      // per-unit density estimate needed. Using it here is exactly why
+      // "Total Inventory" matches the 204 MT opening balance precisely,
+      // while the theoretical/actual gap for every OTHER bucket (where no
+      // single bundle-level actual weight applies to an arbitrary
+      // downstream piece/offcut) is the expected §2.15 "rolling margin" —
+      // not an inconsistency to paper over.
+      const totalInventoryRows = await tx.$queryRawUnsafe<{ kg: string }[]>(
+        `SELECT COALESCE(SUM(actual_weight_kg), 0) AS kg FROM bundles WHERE company_id = $1::uuid ${projectFilter}`,
+        ...params,
+      );
+      const totalInventoryKg = Number(totalInventoryRows[0]!.kg);
+
+      // The other seven buckets (§2.15: a unit's weight is only ever
+      // derived via the company's own rebar_catalog_items density, never
+      // fabricated) — grouped by (diameter_mm, surface_type) first, THEN
+      // joined to that size's density and summed, exactly the join
+      // `reorderAlerts` below already does for "available" alone,
+      // generalized here to every remaining bucket. A size with no
+      // catalog entry contributes 0 kg (COALESCE), surfaced honestly
+      // rather than guessed.
       const bucketRows = await tx.$queryRawUnsafe<
         {
-          total_inventory_m: string;
-          available_m: string;
-          reserved_m: string;
-          on_hold_m: string;
-          in_transit_m: string;
-          installed_m: string;
-          reusable_offcut_m: string;
-          scrap_m: string;
+          available_kg: string;
+          reserved_kg: string;
+          on_hold_kg: string;
+          in_transit_kg: string;
+          installed_kg: string;
+          reusable_offcut_kg: string;
+          scrap_kg: string;
         }[]
       >(
-        `SELECT
-           COALESCE(SUM(CASE WHEN granularity = 'BUNDLE' THEN total_length_m ELSE 0 END), 0) AS total_inventory_m,
-           COALESCE(SUM(CASE WHEN status = 'AVAILABLE' THEN material_unit_remaining_length_m(company_id, id) ELSE 0 END), 0) AS available_m,
-           COALESCE(SUM(CASE WHEN status = 'RESERVED' THEN material_unit_remaining_length_m(company_id, id) ELSE 0 END), 0) AS reserved_m,
-           COALESCE(SUM(CASE WHEN status = 'ON_HOLD' THEN material_unit_remaining_length_m(company_id, id) ELSE 0 END), 0) AS on_hold_m,
-           COALESCE(SUM(CASE WHEN status = 'DISPATCHED' THEN material_unit_remaining_length_m(company_id, id) ELSE 0 END), 0) AS in_transit_m,
-           COALESCE(SUM(CASE WHEN status = 'INSTALLED' THEN total_length_m ELSE 0 END), 0) AS installed_m,
-           COALESCE(SUM(CASE WHEN classification = 'OFFCUT' AND status = 'AVAILABLE' THEN material_unit_remaining_length_m(company_id, id) ELSE 0 END), 0) AS reusable_offcut_m,
-           COALESCE(SUM(CASE WHEN classification = 'SCRAP' THEN total_length_m ELSE 0 END), 0) AS scrap_m
-         FROM material_units
-        WHERE company_id = $1::uuid ${projectFilter}`,
+        `WITH per_size AS (
+           SELECT diameter_mm, surface_type,
+                  COALESCE(SUM(CASE WHEN status = 'AVAILABLE' THEN material_unit_remaining_length_m(company_id, id) ELSE 0 END), 0) AS available_m,
+                  COALESCE(SUM(CASE WHEN status = 'RESERVED' THEN material_unit_remaining_length_m(company_id, id) ELSE 0 END), 0) AS reserved_m,
+                  COALESCE(SUM(CASE WHEN status = 'ON_HOLD' THEN material_unit_remaining_length_m(company_id, id) ELSE 0 END), 0) AS on_hold_m,
+                  COALESCE(SUM(CASE WHEN status = 'DISPATCHED' THEN material_unit_remaining_length_m(company_id, id) ELSE 0 END), 0) AS in_transit_m,
+                  COALESCE(SUM(CASE WHEN status = 'INSTALLED' THEN total_length_m ELSE 0 END), 0) AS installed_m,
+                  COALESCE(SUM(CASE WHEN classification = 'OFFCUT' AND status = 'AVAILABLE' THEN material_unit_remaining_length_m(company_id, id) ELSE 0 END), 0) AS reusable_offcut_m,
+                  COALESCE(SUM(CASE WHEN classification = 'SCRAP' THEN total_length_m ELSE 0 END), 0) AS scrap_m
+             FROM material_units
+            WHERE company_id = $1::uuid ${projectFilter}
+            GROUP BY diameter_mm, surface_type
+         ),
+         densities AS (
+           SELECT DISTINCT ON (diameter_mm, surface_type) diameter_mm, surface_type, linear_density_kg_per_m
+             FROM rebar_catalog_items WHERE company_id = $1::uuid AND is_active
+            ORDER BY diameter_mm, surface_type, id
+         )
+         SELECT
+           COALESCE(SUM(ps.available_m * COALESCE(d.linear_density_kg_per_m, 0)), 0) AS available_kg,
+           COALESCE(SUM(ps.reserved_m * COALESCE(d.linear_density_kg_per_m, 0)), 0) AS reserved_kg,
+           COALESCE(SUM(ps.on_hold_m * COALESCE(d.linear_density_kg_per_m, 0)), 0) AS on_hold_kg,
+           COALESCE(SUM(ps.in_transit_m * COALESCE(d.linear_density_kg_per_m, 0)), 0) AS in_transit_kg,
+           COALESCE(SUM(ps.installed_m * COALESCE(d.linear_density_kg_per_m, 0)), 0) AS installed_kg,
+           COALESCE(SUM(ps.reusable_offcut_m * COALESCE(d.linear_density_kg_per_m, 0)), 0) AS reusable_offcut_kg,
+           COALESCE(SUM(ps.scrap_m * COALESCE(d.linear_density_kg_per_m, 0)), 0) AS scrap_kg
+         FROM per_size ps
+         LEFT JOIN densities d ON d.diameter_mm = ps.diameter_mm AND d.surface_type = ps.surface_type`,
         ...params,
       );
       const b = bucketRows[0]!;
@@ -60,21 +101,31 @@ export function registerReportRoutes(app: FastifyInstance): void {
       // NO project) — only computed in the unfiltered, company-wide view.
       let unallocatedMt = 0;
       if (!q.projectId) {
-        const unallocRows = await tx.$queryRawUnsafe<{ m: string }[]>(
-          `SELECT COALESCE(SUM(material_unit_remaining_length_m(company_id, id)), 0) AS m
-             FROM material_units WHERE company_id = $1::uuid AND project_id IS NULL AND status = 'AVAILABLE'`,
+        const unallocRows = await tx.$queryRawUnsafe<{ kg: string }[]>(
+          `SELECT COALESCE(SUM(material_unit_remaining_length_m(mu.company_id, mu.id) * COALESCE(rci.linear_density_kg_per_m, 0)), 0) AS kg
+             FROM material_units mu
+             LEFT JOIN LATERAL (
+               SELECT linear_density_kg_per_m FROM rebar_catalog_items
+                WHERE company_id = $1::uuid AND diameter_mm = mu.diameter_mm AND surface_type = mu.surface_type AND is_active
+                ORDER BY id LIMIT 1
+             ) rci ON true
+            WHERE mu.company_id = $1::uuid AND mu.project_id IS NULL AND mu.status = 'AVAILABLE'`,
           companyId,
         );
-        unallocatedMt = Number(unallocRows[0]!.m) / KG_PER_MT;
+        unallocatedMt = Number(unallocRows[0]!.kg) / KG_PER_MT;
       }
 
       const stockByDiameter = await tx.$queryRawUnsafe(
-        `SELECT diameter_mm, surface_type, grade_normalized,
-                COALESCE(SUM(CASE WHEN status = 'AVAILABLE' THEN material_unit_remaining_length_m(company_id, id) ELSE 0 END), 0) AS available_length_m
-           FROM material_units
-          WHERE company_id = $1::uuid ${projectFilter}
-          GROUP BY diameter_mm, surface_type, grade_normalized
-          ORDER BY diameter_mm, surface_type, grade_normalized`,
+        `SELECT mu.diameter_mm, mu.surface_type, mu.grade_normalized,
+                COALESCE(SUM(CASE WHEN mu.status = 'AVAILABLE' THEN material_unit_remaining_length_m(mu.company_id, mu.id) ELSE 0 END), 0) AS available_length_m,
+                COALESCE(SUM(CASE WHEN mu.status = 'AVAILABLE' THEN material_unit_remaining_length_m(mu.company_id, mu.id) ELSE 0 END)
+                  * COALESCE(MAX(rci.linear_density_kg_per_m), 0) / 1000, 0) AS available_mt
+           FROM material_units mu
+           LEFT JOIN rebar_catalog_items rci
+             ON rci.company_id = $1::uuid AND rci.diameter_mm = mu.diameter_mm AND rci.surface_type = mu.surface_type AND rci.is_active
+          WHERE mu.company_id = $1::uuid ${projectFilter}
+          GROUP BY mu.diameter_mm, mu.surface_type, mu.grade_normalized
+          ORDER BY mu.diameter_mm, mu.surface_type, mu.grade_normalized`,
         ...params,
       );
 
@@ -114,33 +165,29 @@ export function registerReportRoutes(app: FastifyInstance): void {
       );
 
       return {
-        totalInventoryMt: Number(b.total_inventory_m) / KG_PER_MT,
-        availableStockMt: Number(b.available_m) / KG_PER_MT,
-        reservedStockMt: Number(b.reserved_m) / KG_PER_MT,
-        onHoldMt: Number(b.on_hold_m) / KG_PER_MT,
-        inTransitMt: Number(b.in_transit_m) / KG_PER_MT,
-        installedMt: Number(b.installed_m) / KG_PER_MT,
-        reusableOffcutMt: Number(b.reusable_offcut_m) / KG_PER_MT,
-        scrapMt: Number(b.scrap_m) / KG_PER_MT,
+        totalInventoryMt: totalInventoryKg / KG_PER_MT,
+        availableStockMt: Number(b.available_kg) / KG_PER_MT,
+        reservedStockMt: Number(b.reserved_kg) / KG_PER_MT,
+        onHoldMt: Number(b.on_hold_kg) / KG_PER_MT,
+        inTransitMt: Number(b.in_transit_kg) / KG_PER_MT,
+        installedMt: Number(b.installed_kg) / KG_PER_MT,
+        reusableOffcutMt: Number(b.reusable_offcut_kg) / KG_PER_MT,
+        scrapMt: Number(b.scrap_kg) / KG_PER_MT,
         unallocatedCompanyStockMt: unallocatedMt,
-        scrapPercentage: Number(b.total_inventory_m) > 0 ? (Number(b.scrap_m) / Number(b.total_inventory_m)) * 100 : 0,
-        reusableRemnantRate: Number(b.total_inventory_m) > 0 ? (Number(b.reusable_offcut_m) / Number(b.total_inventory_m)) * 100 : 0,
+        scrapPercentage: totalInventoryKg > 0 ? (Number(b.scrap_kg) / totalInventoryKg) * 100 : 0,
+        reusableRemnantRate: totalInventoryKg > 0 ? (Number(b.reusable_offcut_kg) / totalInventoryKg) * 100 : 0,
         stockByDiameter,
         reorderAlerts,
         unreconciledOperationsCount: Number(unreconciledRows[0]!.ops),
         unreconciledTransfersCount: Number(unreconciledRows[0]!.transfers),
       };
-      // NOTE: the lengths above are in METERS internally (material_unit_
-      // remaining_length_m's own unit) but labeled "...Mt" per the task's
-      // requested field names — reported as metric tons of LENGTH-implied
-      // weight is not meaningful without a diameter-specific density, so
-      // these length-sum fields are reported in meters despite the "Mt"
-      // suffix the task names them with; only `reorderAlerts.available_mt`
-      // (computed via each diameter's actual linear density) is a true
-      // weight figure in metric tons. This mismatch is a deliberate,
-      // documented choice — fabricating a weight from length without a
-      // real per-unit density would violate the "never fabricate a
-      // number" principle that governs this whole reporting layer.
+      // Every *Mt figure above is a genuine weight in metric tons, derived
+      // from each (diameter_mm, surface_type) bucket's own
+      // rebar_catalog_items.linear_density_kg_per_m (§2.15) — never a raw
+      // length figure relabeled. A size with no matching, active catalog
+      // entry contributes 0 kg rather than a guessed density (COALESCE),
+      // so a company that hasn't fully populated its catalog sees an
+      // honestly-understated total, never a fabricated one.
     });
 
     return result;
