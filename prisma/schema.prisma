@@ -1,0 +1,1516 @@
+// =============================================================================
+// SteelTrace — Prisma schema
+//
+// Generated from docs/physical-database-design.md (Edition 2, 46 tables) and
+// CLAUDE.md. This file is schema/scaffolding ONLY (Task 2) — it defines
+// tables, columns, types, and every FK/unique/index expressible in Prisma.
+//
+// Deliberately NOT included here (Task 3 — hand-maintained SQL migration,
+// docs/physical-database-design.md §17):
+//   - Every CHECK constraint and every PARTIAL unique index.
+//   - `spec_compare()` and every validation/self-locking trigger.
+//   - The controlled database functions (register_bundle,
+//     record_processing_operation, dispatch_material_transfer,
+//     receive_transfer_line, split_material_unit, reallocate_project,
+//     release_hold, install_material, record_physical_stock_count,
+//     record_approval) and the REVOKEs that make them the only write path.
+//   - `ENABLE`/`FORCE ROW LEVEL SECURITY` and every `CREATE POLICY`,
+//     including the two global-`users` policies (§6b).
+// Each is called out with a `///` doc comment on the model(s) it applies to,
+// so this schema documents what the SQL layer will enforce.
+//
+// Conventions applied uniformly (§1, §17):
+//   - Every tenant-scoped model (all except User) has `id` + `companyId` and
+//     `@@unique([companyId, id])`.
+//   - Every FK between two tenant-scoped models is a COMPOSITE relation on
+//     [companyId, xId] -> [companyId, id] — never a bare single-column FK —
+//     so a cross-tenant reference is structurally impossible (§13).
+//   - The one deliberate asymmetry (§3, §6, §17): `CompanyMembership.userId`
+//     and `CompanyInvitation.acceptedUserId` are PLAIN single-column
+//     relations to the global `User.id`, because `users` has no companyId.
+//   - "Responsible actor" columns (`*_by_membership_id`) are always composite
+//     FKs to CompanyMembership, never to User directly.
+//   - `onDelete: Restrict, onUpdate: Restrict` on every composite relation:
+//     nothing in this schema is ever hard-deleted by cascade (§15 — removal
+//     is always deactivation/supersession/reclassification, never DELETE).
+//
+// Native-type note: the design doc writes lengths/weights as
+// `numeric(10,3)`, diameters as `numeric(6,2)`, etc. Prisma's PostgreSQL
+// connector exposes this as the `Decimal` Prisma type with the
+// `@db.Decimal(p, s)` native-type attribute — `@db.Numeric(...)` is not a
+// valid Prisma native-type name (verified against the installed Prisma CLI:
+// "Native type Numeric is not supported for postgresql connector"). Postgres
+// itself treats NUMERIC and DECIMAL as synonyms, so `@db.Decimal(p, s)`
+// produces the exact `numeric(p,s)` column the design doc specifies.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// =============================================================================
+// §1a — Enum Types (all 15: 13 carried forward + 2 new in Edition 2)
+// =============================================================================
+
+enum MaterialGranularity {
+  BUNDLE
+  BATCH
+  PIECE
+
+  @@map("material_granularity_enum")
+}
+
+enum MaterialClassification {
+  ORIGINAL
+  PENDING_RECONCILIATION
+  PREPARED
+  OFFCUT
+  SCRAP
+
+  @@map("material_classification_enum")
+}
+
+enum MaterialStatus {
+  AVAILABLE
+  RESERVED
+  CONSUMED
+  DISPATCHED
+  INSTALLED
+  ON_HOLD
+
+  @@map("material_status_enum")
+}
+
+enum ReconciliationStatus {
+  UNRECONCILED
+  BALANCED
+  ADJUSTED
+
+  @@map("reconciliation_status_enum")
+}
+
+enum AttributionMode {
+  EXACT
+  KNOWN_PARTIAL
+  POOLED
+
+  @@map("attribution_mode_enum")
+}
+
+enum MeasurementBasis {
+  LENGTH
+  WEIGHT
+
+  @@map("measurement_basis_enum")
+}
+
+enum AdjustmentType {
+  TOLERANCE
+  CORRECTION
+
+  @@map("adjustment_type_enum")
+}
+
+enum TransferStatus {
+  DISPATCHED
+  PARTIALLY_RECEIVED
+  RECEIVED
+
+  @@map("transfer_status_enum")
+}
+
+enum LocationType {
+  WAREHOUSE
+  PROCESSING_AREA
+  SITE
+  OTHER
+
+  @@map("location_type_enum")
+}
+
+enum RecordStatus {
+  ACTIVE
+  SUPERSEDED
+
+  @@map("record_status_enum")
+}
+
+enum ReleaseType {
+  FULFILLED
+  CANCELLED
+  EXPIRED
+
+  @@map("release_type_enum")
+}
+
+enum ReceiptDisposition {
+  ACCEPTED
+  ON_HOLD
+  DAMAGED_DISCREPANT
+
+  @@map("receipt_disposition_enum")
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+
+  @@map("invitation_status_enum")
+}
+
+/// New, Edition 2 (CLAUDE.md §2.13).
+enum BundleOriginType {
+  OPENING_STOCK
+  GRN_PURCHASE
+
+  @@map("bundle_origin_type_enum")
+}
+
+/// New, Edition 2 (CLAUDE.md §2.14).
+enum RebarSurfaceType {
+  DEFORMED
+  PLAIN
+
+  @@map("rebar_surface_type_enum")
+}
+
+// =============================================================================
+// §3 — Identity, Tenancy
+// =============================================================================
+
+/// Tenant isolation root.
+/// Hand-maintained in SQL migration (Task 3): RLS is irrelevant to this table
+/// itself (it IS the tenant key), but every other table's RLS policy
+/// (`company_id = current_setting('app.current_company_id', true)::uuid`)
+/// resolves against rows here.
+model Company {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  companyMemberships           CompanyMembership[]
+  companyInvitations           CompanyInvitation[]
+  roles                        Role[]
+  projects                     Project[]
+  storageLocations             StorageLocation[]
+  locationNodeTypes            LocationNodeType[]
+  locationNodes                LocationNode[]
+  suppliers                    Supplier[]
+  manufacturers                Manufacturer[]
+  structuralElementTypes       StructuralElementType[]
+  reinforcementPurposes        ReinforcementPurpose[]
+  processingOperationTypes     ProcessingOperationType[]
+  structuralElementInstances   StructuralElementInstance[]
+  rebarCatalogItems            RebarCatalogItem[]
+  shapeCodes                   ShapeCode[]
+  bundles                      Bundle[]
+  bundleAttributeDefinitions   BundleAttributeDefinition[]
+  bundleAttributeValues        BundleAttributeValue[]
+  materialUnits                MaterialUnit[]
+  materialUnitOrigins          MaterialUnitOrigin[]
+  projectAllocations           ProjectAllocation[]
+  workOrders                   WorkOrder[]
+  bbsSchedules                 BbsSchedule[]
+  bbsLines                     BbsLine[]
+  processingOperations         ProcessingOperation[]
+  processingInputs             ProcessingInput[]
+  processingOutputs            ProcessingOutput[]
+  processingOutputSources      ProcessingOutputSource[]
+  materialSplits               MaterialSplit[]
+  materialReservations         MaterialReservation[]
+  materialHoldReleases         MaterialHoldRelease[]
+  conservationAdjustments      ConservationAdjustment[]
+  intendedUsageDeclarations    IntendedUsageDeclaration[]
+  reclassificationEvents       ReclassificationEvent[]
+  physicalStockCounts          PhysicalStockCount[]
+  physicalStockCountLines      PhysicalStockCountLine[]
+  materialTransfers            MaterialTransfer[]
+  materialTransferLines        MaterialTransferLine[]
+  materialTransferReceipts     MaterialTransferReceipt[]
+  materialTransferReceiptLines MaterialTransferReceiptLine[]
+  installations                Installation[]
+  installationLines            InstallationLine[]
+  attachments                  Attachment[]
+  auditLogs                    AuditLog[]
+
+  @@map("companies")
+}
+
+/// Global — the ONE table with no `company_id` (§6).
+/// Hand-maintained in SQL migration (Task 3):
+///   - Partial unique `(auth_provider, auth_provider_subject_id)` WHERE not null.
+///   - RLS policies `users_visible_via_membership` (SELECT, membership-gated)
+///     and `users_self_update` (UPDATE, self only) — §6b. No INSERT policy:
+///     the ordinary app role holds no INSERT grant on this table at all;
+///     only the dedicated `steeltrace_identity_service` role may insert.
+model User {
+  id                    String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email                 String   @unique
+  displayName           String   @map("display_name")
+  authProvider          String   @map("auth_provider")
+  authProviderSubjectId String?  @map("auth_provider_subject_id")
+  passwordHash          String?  @map("password_hash")
+  isActive              Boolean  @default(true) @map("is_active")
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  companyMemberships         CompanyMembership[]
+  acceptedCompanyInvitations CompanyInvitation[]
+
+  @@map("users")
+}
+
+/// The tenant-scoped bridge every "responsible actor" column points to (§3).
+/// Hand-maintained in SQL migration (Task 3): rows are never deleted (no
+/// DELETE grant) — removal is always `isActive -> false` via
+/// `deactivatedAt`/`deactivatedByMembershipId`.
+model CompanyMembership {
+  id                        String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId                 String    @map("company_id") @db.Uuid
+  userId                    String    @map("user_id") @db.Uuid
+  roleId                    String    @map("role_id") @db.Uuid
+  isActive                  Boolean   @default(true) @map("is_active")
+  joinedAt                  DateTime  @default(now()) @map("joined_at") @db.Timestamptz(6)
+  deactivatedAt             DateTime? @map("deactivated_at") @db.Timestamptz(6)
+  deactivatedByMembershipId String?   @map("deactivated_by_membership_id") @db.Uuid
+
+  company                 Company            @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  /// Deliberate asymmetry (§3, §6, §17): plain FK to the global User, NOT composite.
+  user                    User               @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  role                    Role               @relation(fields: [companyId, roleId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  deactivatedByMembership CompanyMembership? @relation("MembershipDeactivatedBy", fields: [companyId, deactivatedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  membershipsDeactivated            CompanyMembership[]        @relation("MembershipDeactivatedBy")
+  invitationsInvited                CompanyInvitation[]        @relation("InvitationInvitedBy")
+  bundlesRegistered                 Bundle[]                   @relation("BundleRegisteredBy")
+  bundlesApproved                   Bundle[]                   @relation("BundleApprovedBy")
+  materialSplitsRecorded            MaterialSplit[]            @relation("MaterialSplitRecordedBy")
+  materialReservationsReserved      MaterialReservation[]      @relation("ReservationReservedBy")
+  materialReservationsReleased      MaterialReservation[]      @relation("ReservationReleasedBy")
+  materialHoldReleasesReleased      MaterialHoldRelease[]      @relation("HoldReleaseReleasedBy")
+  conservationAdjustmentsRecorded   ConservationAdjustment[]   @relation("AdjustmentRecordedBy")
+  conservationAdjustmentsApproved   ConservationAdjustment[]   @relation("AdjustmentApprovedBy")
+  intendedUsageDeclarationsDeclared IntendedUsageDeclaration[] @relation("DeclarationDeclaredBy")
+  reclassificationEventsRecorded    ReclassificationEvent[]    @relation("ReclassificationRecordedBy")
+  reclassificationEventsApproved    ReclassificationEvent[]    @relation("ReclassificationApprovedBy")
+  projectAllocationsAllocated       ProjectAllocation[]        @relation("AllocationAllocatedBy")
+  workOrdersCreated                 WorkOrder[]                @relation("WorkOrderCreatedBy")
+  processingOperationsPerformed     ProcessingOperation[]      @relation("ProcessingOperationPerformedBy")
+  processingOperationsChecked       ProcessingOperation[]      @relation("ProcessingOperationCheckedBy")
+  materialTransfersDispatched       MaterialTransfer[]         @relation("TransferDispatchedBy")
+  materialTransferReceiptsReceived  MaterialTransferReceipt[]  @relation("ReceiptReceivedBy")
+  bbsSchedulesPrepared              BbsSchedule[]              @relation("BbsSchedulePreparedBy")
+  bbsSchedulesApproved              BbsSchedule[]              @relation("BbsScheduleApprovedBy")
+  physicalStockCountsCounted        PhysicalStockCount[]       @relation("StockCountCountedBy")
+  physicalStockCountsVerified       PhysicalStockCount[]       @relation("StockCountVerifiedBy")
+  attachmentsUploaded               Attachment[]               @relation("AttachmentUploadedBy")
+  auditLogsChanged                  AuditLog[]                 @relation("AuditLogChangedBy")
+  installationsInstalled            Installation[]             @relation("InstallationInstalledBy")
+  installationsVerified             Installation[]             @relation("InstallationVerifiedBy")
+
+  @@unique([companyId, userId])
+  @@unique([companyId, id])
+  @@map("company_memberships")
+}
+
+/// New — narrowly-scoped mechanism to bring a person into a company without
+/// exposing the global `users` table to ordinary requests (§6).
+model CompanyInvitation {
+  id                    String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId             String           @map("company_id") @db.Uuid
+  invitedEmail          String           @map("invited_email")
+  roleId                String           @map("role_id") @db.Uuid
+  invitedByMembershipId String           @map("invited_by_membership_id") @db.Uuid
+  invitedAt             DateTime         @default(now()) @map("invited_at") @db.Timestamptz(6)
+  expiresAt             DateTime?        @map("expires_at") @db.Timestamptz(6)
+  status                InvitationStatus @default(PENDING)
+  tokenHash             String           @map("token_hash")
+  acceptedUserId        String?          @map("accepted_user_id") @db.Uuid
+  acceptedAt            DateTime?        @map("accepted_at") @db.Timestamptz(6)
+
+  company             Company           @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  role                Role              @relation(fields: [companyId, roleId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  invitedByMembership CompanyMembership @relation("InvitationInvitedBy", fields: [companyId, invitedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  /// Deliberate asymmetry (§3, §6, §17): plain FK to the global User, NOT composite.
+  acceptedUser        User?             @relation(fields: [acceptedUserId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([companyId, id])
+  @@map("company_invitations")
+}
+
+/// Company-scoped master data.
+model Role {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId String   @map("company_id") @db.Uuid
+  name      String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company            Company             @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  companyMemberships CompanyMembership[]
+  companyInvitations CompanyInvitation[]
+
+  @@unique([companyId, name])
+  @@unique([companyId, id])
+  @@map("roles")
+}
+
+model Project {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId    String   @map("company_id") @db.Uuid
+  name         String
+  buildingType String?  @map("building_type")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company                    Company                     @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  storageLocations           StorageLocation[]
+  locationNodes              LocationNode[]
+  structuralElementInstances StructuralElementInstance[]
+  bundles                    Bundle[]
+  materialUnits              MaterialUnit[]
+  projectAllocationsFrom     ProjectAllocation[]         @relation("ProjectAllocationFromProject")
+  projectAllocationsTo       ProjectAllocation[]         @relation("ProjectAllocationToProject")
+  workOrders                 WorkOrder[]
+  bbsSchedules               BbsSchedule[]
+  processingOperations       ProcessingOperation[]
+  materialTransfers          MaterialTransfer[]
+  installations              Installation[]
+
+  @@unique([companyId, id])
+  @@map("projects")
+}
+
+/// Edition 2 adds a physical storage sub-location hierarchy (`parentStorageLocationId`
+/// + zone/rack/bay) — distinct from `LocationNode`'s *installation* hierarchy.
+/// Hand-maintained in SQL migration (Task 3): cycle-freedom on
+/// `parentStorageLocationId` is application-enforced, not DB-enforced (§17/§3).
+model StorageLocation {
+  id                      String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId               String       @map("company_id") @db.Uuid
+  projectId               String?      @map("project_id") @db.Uuid
+  locationType            LocationType @map("location_type")
+  name                    String
+  parentStorageLocationId String?      @map("parent_storage_location_id") @db.Uuid
+  zoneCode                String?      @map("zone_code")
+  rackCode                String?      @map("rack_code")
+  bayCode                 String?      @map("bay_code")
+  createdAt               DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company               Company          @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  project               Project?         @relation(fields: [companyId, projectId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  parentStorageLocation StorageLocation? @relation("StorageLocationParent", fields: [companyId, parentStorageLocationId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  childStorageLocations      StorageLocation[]     @relation("StorageLocationParent")
+  materialUnitsCurrentlyHere MaterialUnit[]        @relation("MaterialUnitCurrentLocation")
+  processingOperations       ProcessingOperation[]
+  physicalStockCounts        PhysicalStockCount[]
+  materialTransfersFrom      MaterialTransfer[]    @relation("TransferFromLocation")
+  materialTransfersTo        MaterialTransfer[]    @relation("TransferToLocation")
+
+  @@unique([companyId, id])
+  @@index([companyId, projectId])
+  @@index([companyId, parentStorageLocationId])
+  @@map("storage_locations")
+}
+
+model LocationNodeType {
+  id        String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId String @map("company_id") @db.Uuid
+  name      String
+
+  company       Company        @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  locationNodes LocationNode[]
+
+  @@unique([companyId, name])
+  @@unique([companyId, id])
+  @@map("location_node_types")
+}
+
+/// Self-referencing project *installation*-location hierarchy — distinct
+/// from `StorageLocation`'s physical storage sub-location hierarchy.
+/// Hand-maintained in SQL migration (Task 3): cycle-freedom on `parentId` is
+/// application-enforced, not DB-enforced (§17).
+model LocationNode {
+  id                 String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId          String  @map("company_id") @db.Uuid
+  projectId          String  @map("project_id") @db.Uuid
+  parentId           String? @map("parent_id") @db.Uuid
+  locationNodeTypeId String  @map("location_node_type_id") @db.Uuid
+  name               String
+
+  company          Company          @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  project          Project          @relation(fields: [companyId, projectId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  parent           LocationNode?    @relation("LocationNodeParent", fields: [companyId, parentId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  locationNodeType LocationNodeType @relation(fields: [companyId, locationNodeTypeId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  children                   LocationNode[]              @relation("LocationNodeParent")
+  structuralElementInstances StructuralElementInstance[]
+  bbsLines                   BbsLine[]
+  intendedUsageDeclarations  IntendedUsageDeclaration[]
+
+  @@unique([companyId, id])
+  @@index([companyId, projectId, parentId])
+  @@map("location_nodes")
+}
+
+model Supplier {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId String  @map("company_id") @db.Uuid
+  name      String
+  country   String?
+
+  company Company  @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  bundles Bundle[]
+
+  @@unique([companyId, id])
+  @@map("suppliers")
+}
+
+model Manufacturer {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId String  @map("company_id") @db.Uuid
+  name      String
+  country   String?
+
+  company Company  @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  bundles Bundle[]
+
+  @@unique([companyId, id])
+  @@map("manufacturers")
+}
+
+model StructuralElementType {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId String  @map("company_id") @db.Uuid
+  name      String
+  isActive  Boolean @default(true) @map("is_active")
+
+  company                    Company                     @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  structuralElementInstances StructuralElementInstance[]
+  bbsLines                   BbsLine[]
+  intendedUsageDeclarations  IntendedUsageDeclaration[]
+
+  @@unique([companyId, name])
+  @@unique([companyId, id])
+  @@map("structural_element_types")
+}
+
+model ReinforcementPurpose {
+  id        String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId String  @map("company_id") @db.Uuid
+  name      String
+  isActive  Boolean @default(true) @map("is_active")
+
+  company                   Company                    @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  bbsLines                  BbsLine[]
+  intendedUsageDeclarations IntendedUsageDeclaration[]
+  installations             Installation[]
+
+  @@unique([companyId, name])
+  @@unique([companyId, id])
+  @@map("reinforcement_purposes")
+}
+
+model ProcessingOperationType {
+  id                       String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId                String  @map("company_id") @db.Uuid
+  name                     String
+  requiresUniformInputSpec Boolean @default(true) @map("requires_uniform_input_spec")
+  isActive                 Boolean @default(true) @map("is_active")
+
+  company              Company               @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  processingOperations ProcessingOperation[]
+
+  @@unique([companyId, name])
+  @@unique([companyId, id])
+  @@map("processing_operation_types")
+}
+
+model StructuralElementInstance {
+  id                      String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId               String @map("company_id") @db.Uuid
+  projectId               String @map("project_id") @db.Uuid
+  structuralElementTypeId String @map("structural_element_type_id") @db.Uuid
+  locationNodeId          String @map("location_node_id") @db.Uuid
+  referenceCode           String @map("reference_code")
+
+  company               Company               @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  project               Project               @relation(fields: [companyId, projectId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  structuralElementType StructuralElementType @relation(fields: [companyId, structuralElementTypeId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  locationNode          LocationNode          @relation(fields: [companyId, locationNodeId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  bbsLines                  BbsLine[]
+  intendedUsageDeclarations IntendedUsageDeclaration[]
+  installations             Installation[]
+
+  @@unique([companyId, projectId, referenceCode])
+  @@unique([companyId, id])
+  @@map("structural_element_instances")
+}
+
+// =============================================================================
+// §3a — Rebar Catalog and Shape Codes (new, Edition 2)
+// =============================================================================
+
+/// New, Edition 2 (CLAUDE.md §2.15). Reporting/QA reference data only — never
+/// authoritative over any `material_units`/`bundles` quantity column (§14).
+model RebarCatalogItem {
+  id                     String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId              String           @map("company_id") @db.Uuid
+  itemCode               String           @map("item_code")
+  diameterMm             Decimal          @map("diameter_mm") @db.Decimal(6, 2)
+  surfaceType            RebarSurfaceType @default(DEFORMED) @map("surface_type")
+  defaultGrade           String?          @map("default_grade")
+  defaultStandard        String?          @map("default_standard")
+  standardBarLengthM     Decimal?         @map("standard_bar_length_m") @db.Decimal(10, 3)
+  defaultPiecesPerBundle Int?             @map("default_pieces_per_bundle")
+  linearDensityKgPerM    Decimal          @map("linear_density_kg_per_m") @db.Decimal(8, 4)
+  reorderThresholdMt     Decimal?         @map("reorder_threshold_mt") @db.Decimal(10, 3)
+  isActive               Boolean          @default(true) @map("is_active")
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+
+  /// Hand-maintained in SQL migration (Task 3): CHECK `diameter_mm > 0`,
+  /// `linear_density_kg_per_m > 0`.
+  @@unique([companyId, itemCode])
+  @@unique([companyId, id])
+  @@map("rebar_catalog_items")
+}
+
+/// New, Edition 2 (CLAUDE.md §2.16). Company-scoped catalog of standard
+/// bent-bar profiles referenced by `BbsLine`.
+model ShapeCode {
+  id               String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId        String   @map("company_id") @db.Uuid
+  code             String
+  name             String
+  activeDimensions String[] @map("active_dimensions")
+  isActive         Boolean  @default(true) @map("is_active")
+
+  company  Company   @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  bbsLines BbsLine[]
+
+  @@unique([companyId, code])
+  @@unique([companyId, id])
+  @@map("shape_codes")
+}
+
+// =============================================================================
+// §4 — Bundles and Material Units
+// =============================================================================
+
+/// Hand-maintained in SQL migration (Task 3):
+///   - CHECK `piece_count > 0`, `diameter_mm > 0`, `bar_length_m > 0`.
+///   - CHECK `origin_type = 'OPENING_STOCK' OR grn_reference IS NOT NULL`.
+///   - CHECK `(approved_by_membership_id IS NULL) = (approved_at IS NULL)`.
+///   - Trigger-maintained `grade_normalized`/`standard_normalized`.
+///   - Mutable master-data table (§15): ordinary `UPDATE` corrections are
+///     permitted and logged to `audit_log` by trigger — but row CREATION
+///     (paired atomically with its root `material_units` row) only ever
+///     happens through the controlled `register_bundle` function (§12); the
+///     ordinary app role has no direct INSERT grant on this table.
+model Bundle {
+  id                       String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId                String             @map("company_id") @db.Uuid
+  projectId                String?            @map("project_id") @db.Uuid
+  internalReferenceCode    String             @map("internal_reference_code")
+  supplierId               String?            @map("supplier_id") @db.Uuid
+  manufacturerId           String?            @map("manufacturer_id") @db.Uuid
+  countryOfOrigin          String?            @map("country_of_origin")
+  diameterMm               Decimal            @map("diameter_mm") @db.Decimal(6, 2)
+  grade                    String
+  gradeNormalized          String             @map("grade_normalized")
+  standard                 String?
+  standardNormalized       String?            @map("standard_normalized")
+  heatNumber               String?            @map("heat_number")
+  pieceCount               Int                @map("piece_count")
+  barLengthM               Decimal            @map("bar_length_m") @db.Decimal(10, 3)
+  surfaceType              RebarSurfaceType   @default(DEFORMED) @map("surface_type")
+  originType               BundleOriginType   @map("origin_type")
+  grnReference             String?            @map("grn_reference")
+  poReference              String?            @map("po_reference")
+  deliveryNoteNumber       String?            @map("delivery_note_number")
+  vehicleInfo              String?            @map("vehicle_info")
+  weighbridgeTicketNumber  String?            @map("weighbridge_ticket_number")
+  mtcReference             String?            @map("mtc_reference")
+  actualWeightKg           Decimal?           @map("actual_weight_kg") @db.Decimal(10, 3)
+  initialDisposition       ReceiptDisposition @default(ACCEPTED) @map("initial_disposition")
+  approvedByMembershipId   String?            @map("approved_by_membership_id") @db.Uuid
+  approvedAt               DateTime?          @map("approved_at") @db.Timestamptz(6)
+  registeredByMembershipId String             @map("registered_by_membership_id") @db.Uuid
+  registeredAt             DateTime           @default(now()) @map("registered_at") @db.Timestamptz(6)
+
+  company                Company            @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  project                Project?           @relation(fields: [companyId, projectId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  supplier               Supplier?          @relation(fields: [companyId, supplierId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  manufacturer           Manufacturer?      @relation(fields: [companyId, manufacturerId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  registeredByMembership CompanyMembership  @relation("BundleRegisteredBy", fields: [companyId, registeredByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  approvedByMembership   CompanyMembership? @relation("BundleApprovedBy", fields: [companyId, approvedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  bundleAttributeValues BundleAttributeValue[]
+  materialUnits         MaterialUnit[]
+  materialUnitOrigins   MaterialUnitOrigin[]
+
+  @@unique([companyId, internalReferenceCode])
+  @@unique([companyId, id])
+  @@map("bundles")
+}
+
+model BundleAttributeDefinition {
+  id        String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId String @map("company_id") @db.Uuid
+  name      String
+  dataType  String @map("data_type") /// `TEXT | NUMBER | DATE` — hand-maintained CHECK (Task 3).
+
+  company               Company                @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  bundleAttributeValues BundleAttributeValue[]
+
+  @@unique([companyId, name])
+  @@unique([companyId, id])
+  @@map("bundle_attribute_definitions")
+}
+
+/// Hand-maintained in SQL migration (Task 3): CHECK exactly one of
+/// `value_text`/`value_number`/`value_date` populated, matching the
+/// definition's `data_type`.
+model BundleAttributeValue {
+  id                          String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId                   String    @map("company_id") @db.Uuid
+  bundleId                    String    @map("bundle_id") @db.Uuid
+  bundleAttributeDefinitionId String    @map("bundle_attribute_definition_id") @db.Uuid
+  valueText                   String?   @map("value_text")
+  valueNumber                 Decimal?  @map("value_number") @db.Decimal
+  valueDate                   DateTime? @map("value_date") @db.Date
+
+  company                   Company                   @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  bundle                    Bundle                    @relation(fields: [companyId, bundleId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  bundleAttributeDefinition BundleAttributeDefinition @relation(fields: [companyId, bundleAttributeDefinitionId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([companyId, bundleId, bundleAttributeDefinitionId])
+  @@unique([companyId, id])
+  @@map("bundle_attribute_values")
+}
+
+/// The generalized trackable quantity — the genealogy graph's "material" node.
+/// Hand-maintained in SQL migration (Task 3):
+///   - CHECK `quantity_pieces > 0`, `total_length_m > 0`.
+///   - CHECK `unit_length_m IS NOT NULL -> total_length_m = unit_length_m * quantity_pieces`.
+///   - CHECK `unit_weight_kg IS NOT NULL AND total_weight_kg IS NOT NULL -> total_weight_kg = unit_weight_kg * quantity_pieces`.
+///   - CHECK `granularity = 'BUNDLE' -> classification = 'ORIGINAL'`.
+///   - CHECK `classification IN ('SCRAP','PENDING_RECONCILIATION') -> status NOT IN ('CONSUMED','INSTALLED')`.
+///   - Trigger: `status = 'ON_HOLD'` rows cannot be referenced by
+///     `processing_inputs`, `material_reservations`, or `installation_lines`.
+///   - Partial unique `(company_id)` WHERE `project_id IS NULL AND status='AVAILABLE'`.
+///   - Partial unique `(company_id, internal_reference_code)` WHERE not null.
+///   - Only `classification`/`status`/`currentStorageLocationId`/`projectId`
+///     are ever updated post-creation, and only by the controlled functions
+///     in §12 — no direct UPDATE/INSERT grant for the ordinary app role.
+model MaterialUnit {
+  id                       String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId                String                 @map("company_id") @db.Uuid
+  projectId                String?                @map("project_id") @db.Uuid
+  sourceBundleId           String?                @map("source_bundle_id") @db.Uuid
+  granularity              MaterialGranularity    @map("granularity")
+  classification           MaterialClassification @map("classification")
+  status                   MaterialStatus         @map("status")
+  diameterMm               Decimal                @map("diameter_mm") @db.Decimal(6, 2)
+  grade                    String
+  gradeNormalized          String                 @map("grade_normalized")
+  standard                 String?
+  standardNormalized       String?                @map("standard_normalized")
+  surfaceType              RebarSurfaceType       @map("surface_type")
+  quantityPieces           Int                    @map("quantity_pieces")
+  unitLengthM              Decimal?               @map("unit_length_m") @db.Decimal(10, 3)
+  totalLengthM             Decimal                @map("total_length_m") @db.Decimal(10, 3)
+  unitWeightKg             Decimal?               @map("unit_weight_kg") @db.Decimal(10, 3)
+  totalWeightKg            Decimal?               @map("total_weight_kg") @db.Decimal(10, 3)
+  internalReferenceCode    String?                @map("internal_reference_code")
+  currentStorageLocationId String?                @map("current_storage_location_id") @db.Uuid
+  createdAt                DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt                DateTime               @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  company                Company          @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  project                Project?         @relation(fields: [companyId, projectId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  sourceBundle           Bundle?          @relation(fields: [companyId, sourceBundleId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  currentStorageLocation StorageLocation? @relation("MaterialUnitCurrentLocation", fields: [companyId, currentStorageLocationId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  materialUnitOrigins               MaterialUnitOrigin[]
+  processingInputs                  ProcessingInput[]
+  createdByProcessingOutput         ProcessingOutput?
+  materialSplitsAsSource            MaterialSplit[]              @relation("MaterialSplitSource")
+  createdByMaterialSplit            MaterialSplit?               @relation("MaterialSplitResult")
+  materialReservations              MaterialReservation[]
+  holdRelease                       MaterialHoldRelease?
+  reclassificationEvents            ReclassificationEvent[]
+  projectAllocations                ProjectAllocation[]
+  materialTransferLineAsPlaceholder MaterialTransferLine?        @relation("MaterialTransferLinePlaceholder")
+  materialTransferLinesSplitFrom    MaterialTransferLine[]       @relation("MaterialTransferLineSplitFrom")
+  createdByTransferReceipt          MaterialTransferReceiptLine? @relation("MaterialTransferReceiptLineResult")
+  installationLines                 InstallationLine[]
+  physicalStockCountLines           PhysicalStockCountLine[]
+
+  @@unique([companyId, id])
+  @@unique([companyId, internalReferenceCode])
+  @@index([companyId, projectId, status])
+  @@index([companyId, projectId, classification])
+  @@index([sourceBundleId])
+  @@map("material_units")
+}
+
+/// Materialized/derived cache, bundle-level backward genealogy. NEVER
+/// authoritative (§9/§10) — the graph traversal is the source of truth.
+/// Hand-maintained in SQL migration (Task 3): CHECK `contribution_weight IS
+/// NULL OR (contribution_weight > 0 AND contribution_weight <= 1)`.
+model MaterialUnitOrigin {
+  id                 String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId          String          @map("company_id") @db.Uuid
+  materialUnitId     String          @map("material_unit_id") @db.Uuid
+  bundleId           String          @map("bundle_id") @db.Uuid
+  contributionWeight Decimal?        @map("contribution_weight") @db.Decimal(6, 5)
+  confidence         AttributionMode @map("confidence")
+  computedAt         DateTime        @default(now()) @map("computed_at") @db.Timestamptz(6)
+
+  company      Company      @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  materialUnit MaterialUnit @relation(fields: [companyId, materialUnitId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  bundle       Bundle       @relation(fields: [companyId, bundleId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([companyId, materialUnitId, bundleId])
+  @@unique([companyId, id])
+  @@index([companyId, bundleId])
+  @@map("material_unit_origins")
+}
+
+// =============================================================================
+// §5 — Project Allocation (pure immutable history)
+// =============================================================================
+
+/// Hand-maintained in SQL migration (Task 3):
+///   - CHECK `from_project_id IS NOT NULL OR to_project_id IS NOT NULL`.
+///   - Trigger at insert: validates `from_project_id` equals
+///     `material_units.project_id` immediately before insert, then sets
+///     `material_units.project_id = to_project_id` (under the lock the
+///     `reallocate_project` function already holds, §12).
+///   - Pure immutable event log — no UPDATE/DELETE grant.
+model ProjectAllocation {
+  id                      String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId               String   @map("company_id") @db.Uuid
+  materialUnitId          String   @map("material_unit_id") @db.Uuid
+  fromProjectId           String?  @map("from_project_id") @db.Uuid
+  toProjectId             String?  @map("to_project_id") @db.Uuid
+  quantityPieces          Int      @map("quantity_pieces")
+  lengthM                 Decimal  @map("length_m") @db.Decimal(10, 3)
+  allocatedByMembershipId String   @map("allocated_by_membership_id") @db.Uuid
+  allocatedAt             DateTime @default(now()) @map("allocated_at") @db.Timestamptz(6)
+  reason                  String?
+
+  company               Company           @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  materialUnit          MaterialUnit      @relation(fields: [companyId, materialUnitId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  fromProject           Project?          @relation("ProjectAllocationFromProject", fields: [companyId, fromProjectId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  toProject             Project?          @relation("ProjectAllocationToProject", fields: [companyId, toProjectId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  allocatedByMembership CompanyMembership @relation("AllocationAllocatedBy", fields: [companyId, allocatedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([companyId, id])
+  @@index([companyId, materialUnitId, allocatedAt(sort: Desc)])
+  @@map("project_allocations")
+}
+
+// =============================================================================
+// §9 — Processing, Splits, Reservations, Holds, Reclassification, Adjustments
+// =============================================================================
+
+model WorkOrder {
+  id                    String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId             String   @map("company_id") @db.Uuid
+  projectId             String   @map("project_id") @db.Uuid
+  referenceCode         String   @map("reference_code")
+  description           String?
+  bbsLineId             String?  @map("bbs_line_id") @db.Uuid
+  createdByMembershipId String   @map("created_by_membership_id") @db.Uuid
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company             Company           @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  project             Project           @relation(fields: [companyId, projectId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  bbsLine             BbsLine?          @relation("WorkOrderBbsLine", fields: [companyId, bbsLineId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  createdByMembership CompanyMembership @relation("WorkOrderCreatedBy", fields: [companyId, createdByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  processingOperations ProcessingOperation[]
+
+  @@unique([companyId, projectId, referenceCode])
+  @@unique([companyId, id])
+  @@map("work_orders")
+}
+
+/// Hand-maintained in SQL migration (Task 3):
+///   - CHECK `(checked_by_membership_id IS NULL) = (checked_at IS NULL)`.
+///   - Partial unique `(company_id, idempotency_key)` WHERE not null.
+///   - `reconciliation_status`/`is_finalized` are the only columns updated
+///     post-creation, maintained by the `record_processing_operation`
+///     function/trigger (§10, §12). `checked_by_*`/`checked_at` are filled,
+///     at most once, by `record_approval` (§12) — a "controlled single-fill"
+///     update, the only other sanctioned UPDATE on this table.
+model ProcessingOperation {
+  id                      String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId               String               @map("company_id") @db.Uuid
+  projectId               String               @map("project_id") @db.Uuid
+  workOrderId             String?              @map("work_order_id") @db.Uuid
+  referenceCode           String               @map("reference_code")
+  operationTypeId         String               @map("operation_type_id") @db.Uuid
+  storageLocationId       String               @map("storage_location_id") @db.Uuid
+  performedByMembershipId String               @map("performed_by_membership_id") @db.Uuid
+  performedAt             DateTime             @default(now()) @map("performed_at") @db.Timestamptz(6)
+  checkedByMembershipId   String?              @map("checked_by_membership_id") @db.Uuid
+  checkedAt               DateTime?            @map("checked_at") @db.Timestamptz(6)
+  idempotencyKey          String?              @map("idempotency_key")
+  reconciliationStatus    ReconciliationStatus @default(UNRECONCILED) @map("reconciliation_status")
+  isFinalized             Boolean              @default(false) @map("is_finalized")
+
+  company               Company                 @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  project               Project                 @relation(fields: [companyId, projectId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  workOrder             WorkOrder?              @relation(fields: [companyId, workOrderId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  operationType         ProcessingOperationType @relation(fields: [companyId, operationTypeId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  storageLocation       StorageLocation         @relation(fields: [companyId, storageLocationId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  performedByMembership CompanyMembership       @relation("ProcessingOperationPerformedBy", fields: [companyId, performedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  checkedByMembership   CompanyMembership?      @relation("ProcessingOperationCheckedBy", fields: [companyId, checkedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  processingInputs          ProcessingInput[]
+  processingOutputs         ProcessingOutput[]
+  conservationAdjustments   ConservationAdjustment[]
+  intendedUsageDeclarations IntendedUsageDeclaration[]
+
+  @@unique([companyId, referenceCode])
+  @@unique([companyId, id])
+  @@index([companyId, projectId, performedAt])
+  @@index([companyId, workOrderId])
+  @@map("processing_operations")
+}
+
+/// The one join table that keeps its own quantity (§2).
+/// Hand-maintained in SQL migration (Task 3):
+///   - CHECK `quantity_consumed_pieces > 0`, `length_consumed_m > 0`.
+///   - Trigger: referenced unit's `current_storage_location_id` must equal
+///     the operation's `storage_location_id`.
+model ProcessingInput {
+  id                     String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId              String   @map("company_id") @db.Uuid
+  processingOperationId  String   @map("processing_operation_id") @db.Uuid
+  materialUnitId         String   @map("material_unit_id") @db.Uuid
+  quantityConsumedPieces Int      @map("quantity_consumed_pieces")
+  lengthConsumedM        Decimal  @map("length_consumed_m") @db.Decimal(10, 3)
+  weightConsumedKg       Decimal? @map("weight_consumed_kg") @db.Decimal(10, 3)
+  createdAt              DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company             Company             @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  processingOperation ProcessingOperation @relation(fields: [companyId, processingOperationId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  materialUnit        MaterialUnit        @relation(fields: [companyId, materialUnitId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  processingOutputSources ProcessingOutputSource[]
+
+  @@unique([companyId, id])
+  @@index([companyId, materialUnitId])
+  @@index([companyId, processingOperationId])
+  @@map("processing_inputs")
+}
+
+/// Simplified: no quantity columns (§2) — the created `material_units` row
+/// carries them.
+/// Hand-maintained in SQL migration (Task 3): trigger enforces the 4 valid
+/// `(attribution_mode, processing_output_sources row count)` shapes (§10)
+/// and the §8 spec rules; sets the new unit's `current_storage_location_id`.
+model ProcessingOutput {
+  id                    String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId             String          @map("company_id") @db.Uuid
+  processingOperationId String          @map("processing_operation_id") @db.Uuid
+  materialUnitId        String          @map("material_unit_id") @db.Uuid
+  attributionMode       AttributionMode @map("attribution_mode")
+  createdAt             DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company             Company             @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  processingOperation ProcessingOperation @relation(fields: [companyId, processingOperationId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  materialUnit        MaterialUnit        @relation(fields: [companyId, materialUnitId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  processingOutputSources   ProcessingOutputSource[]
+  intendedUsageDeclarations IntendedUsageDeclaration[]
+
+  @@unique([companyId, materialUnitId])
+  @@unique([companyId, id])
+  @@map("processing_outputs")
+}
+
+/// Hand-maintained in SQL migration (Task 3): CHECK `contribution_weight IS
+/// NULL OR (contribution_weight > 0 AND contribution_weight <= 1)`.
+model ProcessingOutputSource {
+  id                 String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId          String   @map("company_id") @db.Uuid
+  processingOutputId String   @map("processing_output_id") @db.Uuid
+  processingInputId  String   @map("processing_input_id") @db.Uuid
+  contributionWeight Decimal? @map("contribution_weight") @db.Decimal(6, 5)
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company          Company          @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  processingOutput ProcessingOutput @relation(fields: [companyId, processingOutputId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  processingInput  ProcessingInput  @relation(fields: [companyId, processingInputId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([companyId, processingOutputId, processingInputId])
+  @@unique([companyId, id])
+  @@index([companyId, processingOutputId])
+  @@index([companyId, processingInputId])
+  @@map("processing_output_sources")
+}
+
+/// Simplified: no quantity columns.
+/// Hand-maintained in SQL migration (Task 3): trigger requires source and
+/// resulting units' `current_storage_location_id` to be equal (no
+/// relocation — that's `MaterialTransfer`'s job).
+model MaterialSplit {
+  id                      String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId               String   @map("company_id") @db.Uuid
+  sourceMaterialUnitId    String   @map("source_material_unit_id") @db.Uuid
+  resultingMaterialUnitId String   @map("resulting_material_unit_id") @db.Uuid
+  reason                  String
+  recordedByMembershipId  String   @map("recorded_by_membership_id") @db.Uuid
+  createdAt               DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company               Company           @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  sourceMaterialUnit    MaterialUnit      @relation("MaterialSplitSource", fields: [companyId, sourceMaterialUnitId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  resultingMaterialUnit MaterialUnit      @relation("MaterialSplitResult", fields: [companyId, resultingMaterialUnitId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  recordedByMembership  CompanyMembership @relation("MaterialSplitRecordedBy", fields: [companyId, recordedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([companyId, resultingMaterialUnitId])
+  @@unique([companyId, id])
+  @@index([companyId, sourceMaterialUnitId])
+  @@map("material_splits")
+}
+
+/// Whole-unit only (§14).
+/// Hand-maintained in SQL migration (Task 3):
+///   - CHECK `released_at IS NOT NULL <=> release_type IS NOT NULL`.
+///   - Partial unique `(company_id, material_unit_id)` WHERE `released_at IS NULL`.
+model MaterialReservation {
+  id                         String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId                  String       @map("company_id") @db.Uuid
+  materialUnitId             String       @map("material_unit_id") @db.Uuid
+  intendedUsageDeclarationId String?      @map("intended_usage_declaration_id") @db.Uuid
+  bbsLineId                  String?      @map("bbs_line_id") @db.Uuid
+  reservedByMembershipId     String       @map("reserved_by_membership_id") @db.Uuid
+  reservedAt                 DateTime     @default(now()) @map("reserved_at") @db.Timestamptz(6)
+  expiresAt                  DateTime?    @map("expires_at") @db.Timestamptz(6)
+  releasedAt                 DateTime?    @map("released_at") @db.Timestamptz(6)
+  releasedByMembershipId     String?      @map("released_by_membership_id") @db.Uuid
+  releaseType                ReleaseType? @map("release_type")
+  releaseReason              String?      @map("release_reason")
+
+  company                  Company                   @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  materialUnit             MaterialUnit              @relation(fields: [companyId, materialUnitId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  intendedUsageDeclaration IntendedUsageDeclaration? @relation(fields: [companyId, intendedUsageDeclarationId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  bbsLine                  BbsLine?                  @relation("ReservationBbsLine", fields: [companyId, bbsLineId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  reservedByMembership     CompanyMembership         @relation("ReservationReservedBy", fields: [companyId, reservedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  releasedByMembership     CompanyMembership?        @relation("ReservationReleasedBy", fields: [companyId, releasedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([companyId, id])
+  @@map("material_reservations")
+}
+
+/// New — releases a unit born `ON_HOLD` (§11).
+/// Hand-maintained in SQL migration (Task 3): trigger sets the unit's
+/// `status` (must currently be `ON_HOLD`) -> `AVAILABLE`.
+model MaterialHoldRelease {
+  id                     String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId              String   @map("company_id") @db.Uuid
+  materialUnitId         String   @map("material_unit_id") @db.Uuid
+  releasedByMembershipId String   @map("released_by_membership_id") @db.Uuid
+  releasedAt             DateTime @default(now()) @map("released_at") @db.Timestamptz(6)
+  reason                 String
+
+  company              Company           @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  materialUnit         MaterialUnit      @relation(fields: [companyId, materialUnitId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  releasedByMembership CompanyMembership @relation("HoldReleaseReleasedBy", fields: [companyId, releasedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([companyId, materialUnitId])
+  @@unique([companyId, id])
+  @@map("material_hold_releases")
+}
+
+/// Hand-maintained in SQL migration (Task 3):
+///   - CHECK exactly one of `(processing_operation_id, material_transfer_line_id,
+///     physical_stock_count_line_id)` is NOT NULL (three-way, Edition 2).
+///   - CHECK `(approved_by_membership_id IS NULL) = (approved_at IS NULL)`.
+///   - `amount` is signed — see §10's one sign convention.
+model ConservationAdjustment {
+  id                       String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId                String           @map("company_id") @db.Uuid
+  processingOperationId    String?          @map("processing_operation_id") @db.Uuid
+  materialTransferLineId   String?          @map("material_transfer_line_id") @db.Uuid
+  physicalStockCountLineId String?          @map("physical_stock_count_line_id") @db.Uuid
+  measurementBasis         MeasurementBasis @map("measurement_basis")
+  amount                   Decimal          @db.Decimal(10, 3)
+  adjustmentType           AdjustmentType   @map("adjustment_type")
+  reason                   String
+  recordedByMembershipId   String           @map("recorded_by_membership_id") @db.Uuid
+  approvedByMembershipId   String?          @map("approved_by_membership_id") @db.Uuid
+  approvedAt               DateTime?        @map("approved_at") @db.Timestamptz(6)
+  createdAt                DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company                Company                 @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  processingOperation    ProcessingOperation?    @relation(fields: [companyId, processingOperationId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  materialTransferLine   MaterialTransferLine?   @relation(fields: [companyId, materialTransferLineId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  physicalStockCountLine PhysicalStockCountLine? @relation(fields: [companyId, physicalStockCountLineId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  recordedByMembership   CompanyMembership       @relation("AdjustmentRecordedBy", fields: [companyId, recordedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  approvedByMembership   CompanyMembership?      @relation("AdjustmentApprovedBy", fields: [companyId, approvedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([companyId, id])
+  @@map("conservation_adjustments")
+}
+
+/// Hand-maintained in SQL migration (Task 3):
+///   - CHECK exactly one of `processing_operation_id`/`processing_output_id` set.
+///   - CHECK `structural_element_type_id IS NOT NULL OR structural_element_instance_id IS NOT NULL`.
+model IntendedUsageDeclaration {
+  id                          String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId                   String       @map("company_id") @db.Uuid
+  processingOperationId       String?      @map("processing_operation_id") @db.Uuid
+  processingOutputId          String?      @map("processing_output_id") @db.Uuid
+  structuralElementTypeId     String?      @map("structural_element_type_id") @db.Uuid
+  structuralElementInstanceId String?      @map("structural_element_instance_id") @db.Uuid
+  locationNodeId              String?      @map("location_node_id") @db.Uuid
+  reinforcementPurposeId      String       @map("reinforcement_purpose_id") @db.Uuid
+  bbsLineId                   String?      @map("bbs_line_id") @db.Uuid
+  declaredByMembershipId      String       @map("declared_by_membership_id") @db.Uuid
+  declaredAt                  DateTime     @default(now()) @map("declared_at") @db.Timestamptz(6)
+  status                      RecordStatus @default(ACTIVE)
+  supersedesId                String?      @map("supersedes_id") @db.Uuid
+
+  company                   Company                    @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  processingOperation       ProcessingOperation?       @relation(fields: [companyId, processingOperationId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  processingOutput          ProcessingOutput?          @relation(fields: [companyId, processingOutputId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  structuralElementType     StructuralElementType?     @relation(fields: [companyId, structuralElementTypeId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict, map: "iud_structural_element_type_fkey")
+  structuralElementInstance StructuralElementInstance? @relation(fields: [companyId, structuralElementInstanceId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict, map: "iud_structural_element_instance_fkey")
+  locationNode              LocationNode?              @relation(fields: [companyId, locationNodeId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  reinforcementPurpose      ReinforcementPurpose       @relation(fields: [companyId, reinforcementPurposeId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  bbsLine                   BbsLine?                   @relation("DeclarationBbsLine", fields: [companyId, bbsLineId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  declaredByMembership      CompanyMembership          @relation("DeclarationDeclaredBy", fields: [companyId, declaredByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  supersedes                IntendedUsageDeclaration?  @relation("IntendedUsageDeclarationSupersedes", fields: [companyId, supersedesId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  supersededByDeclarations IntendedUsageDeclaration[] @relation("IntendedUsageDeclarationSupersedes")
+  materialReservations     MaterialReservation[]
+  installations            Installation[]
+
+  @@unique([companyId, id])
+  @@map("intended_usage_declarations")
+}
+
+/// Hand-maintained in SQL migration (Task 3):
+///   - CHECK (trigger) `(from, to)` must be a valid pair —
+///     `PENDING_RECONCILIATION -> {PREPARED, OFFCUT, SCRAP}`, `OFFCUT -> SCRAP`.
+///   - CHECK `(approved_by_membership_id IS NULL) = (approved_at IS NULL)`.
+///   - Pure immutable event log except for the single-fill
+///     `approved_by_*`/`approved_at` columns, filled at most once by the
+///     `record_approval` function (§12).
+model ReclassificationEvent {
+  id                     String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId              String                 @map("company_id") @db.Uuid
+  materialUnitId         String                 @map("material_unit_id") @db.Uuid
+  fromClassification     MaterialClassification @map("from_classification")
+  toClassification       MaterialClassification @map("to_classification")
+  reason                 String
+  recordedByMembershipId String                 @map("recorded_by_membership_id") @db.Uuid
+  approvedByMembershipId String?                @map("approved_by_membership_id") @db.Uuid
+  approvedAt             DateTime?              @map("approved_at") @db.Timestamptz(6)
+  createdAt              DateTime               @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company              Company            @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  materialUnit         MaterialUnit       @relation(fields: [companyId, materialUnitId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  recordedByMembership CompanyMembership  @relation("ReclassificationRecordedBy", fields: [companyId, recordedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  approvedByMembership CompanyMembership? @relation("ReclassificationApprovedBy", fields: [companyId, approvedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([companyId, id])
+  @@map("reclassification_events")
+}
+
+// =============================================================================
+// §9a — Bar Bending Schedules (BBS) (new, Edition 2)
+// =============================================================================
+
+/// New, Edition 2 (CLAUDE.md §2.16).
+/// Hand-maintained in SQL migration (Task 3): CHECK `(approved_by_membership_id
+/// IS NULL) = (approved_at IS NULL)`. Supersede-chain pattern (§15):
+/// `status` toggles `ACTIVE -> SUPERSEDED`.
+model BbsSchedule {
+  id                     String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId              String       @map("company_id") @db.Uuid
+  projectId              String       @map("project_id") @db.Uuid
+  referenceCode          String       @map("reference_code")
+  drawingNumber          String?      @map("drawing_number")
+  drawingRevision        String?      @map("drawing_revision")
+  wastageAllowancePct    Decimal?     @map("wastage_allowance_pct") @db.Decimal(5, 2)
+  status                 RecordStatus @default(ACTIVE)
+  preparedByMembershipId String       @map("prepared_by_membership_id") @db.Uuid
+  approvedByMembershipId String?      @map("approved_by_membership_id") @db.Uuid
+  approvedAt             DateTime?    @map("approved_at") @db.Timestamptz(6)
+  createdAt              DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company              Company            @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  project              Project            @relation(fields: [companyId, projectId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  preparedByMembership CompanyMembership  @relation("BbsSchedulePreparedBy", fields: [companyId, preparedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  approvedByMembership CompanyMembership? @relation("BbsScheduleApprovedBy", fields: [companyId, approvedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  bbsLines BbsLine[]
+
+  @@unique([companyId, projectId, referenceCode])
+  @@unique([companyId, id])
+  @@map("bbs_schedules")
+}
+
+/// New, Edition 2 (CLAUDE.md §2.16).
+/// Hand-maintained in SQL migration (Task 3):
+///   - CHECK `structural_element_type_id IS NOT NULL OR structural_element_instance_id IS NOT NULL`.
+///   - CHECK `cut_length_m > 0`, `bars_per_member > 0`, `member_count > 0`,
+///     `total_bars_required = bars_per_member * member_count`.
+model BbsLine {
+  id                          String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId                   String           @map("company_id") @db.Uuid
+  bbsScheduleId               String           @map("bbs_schedule_id") @db.Uuid
+  structuralElementTypeId     String?          @map("structural_element_type_id") @db.Uuid
+  structuralElementInstanceId String?          @map("structural_element_instance_id") @db.Uuid
+  locationNodeId              String?          @map("location_node_id") @db.Uuid
+  reinforcementPurposeId      String           @map("reinforcement_purpose_id") @db.Uuid
+  barMark                     String           @map("bar_mark")
+  diameterMm                  Decimal          @map("diameter_mm") @db.Decimal(6, 2)
+  surfaceType                 RebarSurfaceType @default(DEFORMED) @map("surface_type")
+  gradeNormalized             String           @map("grade_normalized")
+  shapeCodeId                 String           @map("shape_code_id") @db.Uuid
+  dimAMm                      Decimal?         @map("dim_a_mm") @db.Decimal(8, 2)
+  dimBMm                      Decimal?         @map("dim_b_mm") @db.Decimal(8, 2)
+  dimCMm                      Decimal?         @map("dim_c_mm") @db.Decimal(8, 2)
+  dimDMm                      Decimal?         @map("dim_d_mm") @db.Decimal(8, 2)
+  dimEMm                      Decimal?         @map("dim_e_mm") @db.Decimal(8, 2)
+  dimRMm                      Decimal?         @map("dim_r_mm") @db.Decimal(8, 2)
+  cutLengthM                  Decimal          @map("cut_length_m") @db.Decimal(10, 3)
+  barsPerMember               Int              @map("bars_per_member")
+  memberCount                 Int              @map("member_count")
+  totalBarsRequired           Int              @map("total_bars_required")
+
+  company                   Company                    @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  bbsSchedule               BbsSchedule                @relation(fields: [companyId, bbsScheduleId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  structuralElementType     StructuralElementType?     @relation(fields: [companyId, structuralElementTypeId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  structuralElementInstance StructuralElementInstance? @relation(fields: [companyId, structuralElementInstanceId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  locationNode              LocationNode?              @relation(fields: [companyId, locationNodeId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  reinforcementPurpose      ReinforcementPurpose       @relation(fields: [companyId, reinforcementPurposeId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  shapeCode                 ShapeCode                  @relation(fields: [companyId, shapeCodeId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  workOrders                WorkOrder[]                @relation("WorkOrderBbsLine")
+  materialReservations      MaterialReservation[]      @relation("ReservationBbsLine")
+  intendedUsageDeclarations IntendedUsageDeclaration[] @relation("DeclarationBbsLine")
+  installations             Installation[]             @relation("InstallationBbsLine")
+
+  @@unique([companyId, id])
+  @@index([companyId, bbsScheduleId])
+  @@index([companyId, shapeCodeId])
+  @@map("bbs_lines")
+}
+
+// =============================================================================
+// §9b — Physical Stock Count & Variance Reconciliation (new, Edition 2)
+// =============================================================================
+
+/// New, Edition 2 (CLAUDE.md §2.17).
+/// Hand-maintained in SQL migration (Task 3): CHECK `(verified_by_membership_id
+/// IS NULL) = (verified_at IS NULL)`.
+model PhysicalStockCount {
+  id                     String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId              String       @map("company_id") @db.Uuid
+  storageLocationId      String       @map("storage_location_id") @db.Uuid
+  referenceCode          String       @map("reference_code")
+  countDate              DateTime     @map("count_date") @db.Date
+  status                 RecordStatus @default(ACTIVE)
+  countedByMembershipId  String       @map("counted_by_membership_id") @db.Uuid
+  verifiedByMembershipId String?      @map("verified_by_membership_id") @db.Uuid
+  verifiedAt             DateTime?    @map("verified_at") @db.Timestamptz(6)
+  notes                  String?
+  createdAt              DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company              Company            @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  storageLocation      StorageLocation    @relation(fields: [companyId, storageLocationId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  countedByMembership  CompanyMembership  @relation("StockCountCountedBy", fields: [companyId, countedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  verifiedByMembership CompanyMembership? @relation("StockCountVerifiedBy", fields: [companyId, verifiedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  physicalStockCountLines PhysicalStockCountLine[]
+
+  @@unique([companyId, referenceCode])
+  @@unique([companyId, id])
+  @@map("physical_stock_counts")
+}
+
+/// New, Edition 2 (CLAUDE.md §2.17).
+/// Hand-maintained in SQL migration (Task 3): CHECK `variance_length_m =
+/// counted_length_m - system_length_m`. A variance is only a recorded
+/// observation — it is not itself a write to inventory until a
+/// corresponding, approved `ConservationAdjustment` exists (§9b).
+model PhysicalStockCountLine {
+  id                   String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId            String  @map("company_id") @db.Uuid
+  physicalStockCountId String  @map("physical_stock_count_id") @db.Uuid
+  materialUnitId       String  @map("material_unit_id") @db.Uuid
+  systemPieces         Int     @map("system_pieces")
+  systemLengthM        Decimal @map("system_length_m") @db.Decimal(10, 3)
+  countedPieces        Int     @map("counted_pieces")
+  countedLengthM       Decimal @map("counted_length_m") @db.Decimal(10, 3)
+  varianceLengthM      Decimal @map("variance_length_m") @db.Decimal(10, 3)
+  investigationNotes   String? @map("investigation_notes")
+
+  company            Company            @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  physicalStockCount PhysicalStockCount @relation(fields: [companyId, physicalStockCountId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  materialUnit       MaterialUnit       @relation(fields: [companyId, materialUnitId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  conservationAdjustments ConservationAdjustment[]
+
+  @@unique([companyId, physicalStockCountId, materialUnitId])
+  @@unique([companyId, id])
+  @@map("physical_stock_count_lines")
+}
+
+// =============================================================================
+// §11 — Receiving, Transfers, and Multiple Dispositions Per Receipt
+// =============================================================================
+
+/// Hand-maintained in SQL migration (Task 3):
+///   - CHECK `from_location_id <> to_location_id`.
+///   - Partial unique `(company_id, idempotency_key)` WHERE not null.
+///   - Trigger gates `status -> 'RECEIVED'`: every line's placeholder must
+///     have `remaining() = 0` (§9).
+model MaterialTransfer {
+  id                       String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId                String               @map("company_id") @db.Uuid
+  projectId                String               @map("project_id") @db.Uuid
+  fromLocationId           String               @map("from_location_id") @db.Uuid
+  toLocationId             String               @map("to_location_id") @db.Uuid
+  status                   TransferStatus       @default(DISPATCHED)
+  dispatchedByMembershipId String               @map("dispatched_by_membership_id") @db.Uuid
+  dispatchedAt             DateTime             @default(now()) @map("dispatched_at") @db.Timestamptz(6)
+  vehicleInfo              String?              @map("vehicle_info")
+  idempotencyKey           String?              @map("idempotency_key")
+  reconciliationStatus     ReconciliationStatus @default(UNRECONCILED) @map("reconciliation_status")
+
+  company                Company           @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  project                Project           @relation(fields: [companyId, projectId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  fromLocation           StorageLocation   @relation("TransferFromLocation", fields: [companyId, fromLocationId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  toLocation             StorageLocation   @relation("TransferToLocation", fields: [companyId, toLocationId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  dispatchedByMembership CompanyMembership @relation("TransferDispatchedBy", fields: [companyId, dispatchedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  materialTransferLines    MaterialTransferLine[]
+  materialTransferReceipts MaterialTransferReceipt[]
+
+  @@unique([companyId, id])
+  @@index([companyId, projectId, status, dispatchedAt])
+  @@map("material_transfers")
+}
+
+/// Simplified: no quantity columns (§2); always a freshly split placeholder.
+model MaterialTransferLine {
+  id                      String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId               String   @map("company_id") @db.Uuid
+  materialTransferId      String   @map("material_transfer_id") @db.Uuid
+  materialUnitId          String   @map("material_unit_id") @db.Uuid
+  splitFromMaterialUnitId String   @map("split_from_material_unit_id") @db.Uuid
+  createdAt               DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company               Company          @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  materialTransfer      MaterialTransfer @relation(fields: [companyId, materialTransferId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  materialUnit          MaterialUnit     @relation("MaterialTransferLinePlaceholder", fields: [companyId, materialUnitId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  splitFromMaterialUnit MaterialUnit     @relation("MaterialTransferLineSplitFrom", fields: [companyId, splitFromMaterialUnitId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  materialTransferReceiptLines MaterialTransferReceiptLine[]
+  conservationAdjustments      ConservationAdjustment[]
+
+  @@unique([companyId, materialUnitId])
+  @@unique([companyId, id])
+  @@index([companyId, splitFromMaterialUnitId])
+  @@map("material_transfer_lines")
+}
+
+/// One transfer, many receipt events over time.
+model MaterialTransferReceipt {
+  id                     String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId              String   @map("company_id") @db.Uuid
+  materialTransferId     String   @map("material_transfer_id") @db.Uuid
+  receivedByMembershipId String   @map("received_by_membership_id") @db.Uuid
+  receivedAt             DateTime @default(now()) @map("received_at") @db.Timestamptz(6)
+  notes                  String?
+
+  company              Company           @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  materialTransfer     MaterialTransfer  @relation(fields: [companyId, materialTransferId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  receivedByMembership CompanyMembership @relation("ReceiptReceivedBy", fields: [companyId, receivedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  materialTransferReceiptLines MaterialTransferReceiptLine[]
+
+  @@unique([companyId, id])
+  @@map("material_transfer_receipts")
+}
+
+/// Simplified (no quantity columns, §2), plus `disposition` (resolves issue #2).
+/// One receipt event may contain several rows against the same
+/// `materialTransferLineId`, each with its own disposition and freshly
+/// materialized unit.
+/// Hand-maintained in SQL migration (Task 3):
+///   - Trigger at insert: new unit's `status` = `AVAILABLE` if
+///     `disposition='ACCEPTED'`, else `ON_HOLD`; `current_storage_location_id`
+///     = the transfer's `to_location_id`; spec inherited unchanged.
+///   - Trigger, cumulative check: `Σ(resulting units' total_length_m) +
+///     Σ(conservation_adjustments.amount > 0) <= placeholder.total_length_m`.
+model MaterialTransferReceiptLine {
+  id                        String             @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId                 String             @map("company_id") @db.Uuid
+  materialTransferReceiptId String             @map("material_transfer_receipt_id") @db.Uuid
+  materialTransferLineId    String             @map("material_transfer_line_id") @db.Uuid
+  resultingMaterialUnitId   String             @map("resulting_material_unit_id") @db.Uuid
+  disposition               ReceiptDisposition @default(ACCEPTED)
+  createdAt                 DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company                 Company                 @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  materialTransferReceipt MaterialTransferReceipt @relation(fields: [companyId, materialTransferReceiptId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict, map: "mtrl_receipt_fkey")
+  materialTransferLine    MaterialTransferLine    @relation(fields: [companyId, materialTransferLineId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict, map: "mtrl_transfer_line_fkey")
+  resultingMaterialUnit   MaterialUnit            @relation("MaterialTransferReceiptLineResult", fields: [companyId, resultingMaterialUnitId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([companyId, resultingMaterialUnitId])
+  @@unique([companyId, id])
+  @@index([companyId, materialTransferLineId])
+  @@map("material_transfer_receipt_lines")
+}
+
+// =============================================================================
+// Installation — canonical definition (docs/physical-database-design.md §11a)
+//
+// §11a closes the documentation gap found during Task 2: `installations`/
+// `installation_lines` now have an explicit, column-by-column definition.
+// This supersedes Task 2's inferred shape, which had (incorrectly) put
+// `structuralElementInstanceId`/`reinforcementPurposeId` on `InstallationLine`
+// — the canonical shape puts them on `Installation` itself: ONE installation
+// event targets ONE element + ONE purpose, fed by potentially MANY
+// `InstallationLine` rows (one per source `MaterialUnit`) — matching
+// data-model.md §15 Example D (one `Installation` for Column C-12 / main
+// reinforcement, three `InstallationLine` rows, one per source unit).
+// =============================================================================
+
+/// Supersede-chain pattern (§15), with its own maker-checker site QC
+/// sign-off (`verifiedByMembershipId`/`verifiedAt`) — the same combination
+/// `BbsSchedule` already uses.
+/// Hand-maintained in SQL migration (Task 3): CHECK `(verified_by_membership_id
+/// IS NULL) = (verified_at IS NULL)`.
+model Installation {
+  id                          String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId                   String       @map("company_id") @db.Uuid
+  projectId                   String       @map("project_id") @db.Uuid
+  structuralElementInstanceId String       @map("structural_element_instance_id") @db.Uuid
+  reinforcementPurposeId      String       @map("reinforcement_purpose_id") @db.Uuid
+  intendedUsageDeclarationId  String?      @map("intended_usage_declaration_id") @db.Uuid
+  bbsLineId                   String?      @map("bbs_line_id") @db.Uuid
+  installedByMembershipId     String       @map("installed_by_membership_id") @db.Uuid
+  installedAt                 DateTime     @default(now()) @map("installed_at") @db.Timestamptz(6)
+  verifiedByMembershipId      String?      @map("verified_by_membership_id") @db.Uuid
+  verifiedAt                  DateTime?    @map("verified_at") @db.Timestamptz(6)
+  status                      RecordStatus @default(ACTIVE)
+  supersedesId                String?      @map("supersedes_id") @db.Uuid
+  notes                       String?
+
+  company                   Company                   @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  project                   Project                   @relation(fields: [companyId, projectId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  structuralElementInstance StructuralElementInstance @relation(fields: [companyId, structuralElementInstanceId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  reinforcementPurpose      ReinforcementPurpose      @relation(fields: [companyId, reinforcementPurposeId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  intendedUsageDeclaration  IntendedUsageDeclaration? @relation(fields: [companyId, intendedUsageDeclarationId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  bbsLine                   BbsLine?                  @relation("InstallationBbsLine", fields: [companyId, bbsLineId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  installedByMembership     CompanyMembership         @relation("InstallationInstalledBy", fields: [companyId, installedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  verifiedByMembership      CompanyMembership?        @relation("InstallationVerifiedBy", fields: [companyId, verifiedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  supersedes                Installation?             @relation("InstallationSupersedes", fields: [companyId, supersedesId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  supersededByInstallations Installation[]     @relation("InstallationSupersedes")
+  installationLines         InstallationLine[]
+
+  @@unique([companyId, id])
+  @@index([companyId, projectId, installedAt])
+  @@index([companyId, structuralElementInstanceId])
+  @@map("installations")
+}
+
+/// Pure immutable event log (§15/§16) — NO quantity/length/weight columns:
+/// installation always consumes the entire `MaterialUnit` row it references
+/// (`install_material` has no partial-amount parameter at all, §12).
+/// Deliberately NOT unique on `materialUnitId` alone (only on
+/// `(companyId, installationId, materialUnitId)`) — a superseded
+/// `Installation`'s lines legitimately keep referencing a unit that a new,
+/// superseding `Installation`'s lines also reference (§11a).
+model InstallationLine {
+  id             String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId      String   @map("company_id") @db.Uuid
+  installationId String   @map("installation_id") @db.Uuid
+  materialUnitId String   @map("material_unit_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  company      Company      @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  installation Installation @relation(fields: [companyId, installationId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+  materialUnit MaterialUnit @relation(fields: [companyId, materialUnitId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([companyId, installationId, materialUnitId])
+  @@unique([companyId, id])
+  @@index([companyId, materialUnitId])
+  @@index([companyId, installationId])
+  @@map("installation_lines")
+}
+
+// =============================================================================
+// §15 — Auditability: Document Attachments & Audit Log
+// =============================================================================
+
+/// New, Edition 2 (CLAUDE.md §2.19). `targetTable`/`targetRecordId` are a
+/// deliberately generic polymorphic reference (MTC certificates, weighbridge
+/// tickets, delivery notes, signed count sheets can each attach to several
+/// different kinds of record) — NOT a Prisma/DB foreign key.
+/// Hand-maintained in SQL migration (Task 3):
+///   - CHECK `file_size_bytes > 0`.
+///   - Trigger validates `target_table` against a fixed allow-list and that
+///     the referenced row's own `company_id` matches this attachment's
+///     `company_id` — since a polymorphic string reference can't be a real
+///     composite FK, this trigger is what preserves the "no cross-tenant
+///     relationship" guarantee (§13) for this one necessarily-generic table.
+model Attachment {
+  id                     String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId              String   @map("company_id") @db.Uuid
+  targetTable            String   @map("target_table")
+  targetRecordId         String   @map("target_record_id") @db.Uuid
+  fileName               String   @map("file_name")
+  mimeType               String   @map("mime_type")
+  fileSizeBytes          BigInt   @map("file_size_bytes")
+  storageKey             String   @map("storage_key")
+  uploadedByMembershipId String   @map("uploaded_by_membership_id") @db.Uuid
+  uploadedAt             DateTime @default(now()) @map("uploaded_at") @db.Timestamptz(6)
+
+  company              Company           @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  uploadedByMembership CompanyMembership @relation("AttachmentUploadedBy", fields: [companyId, uploadedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([companyId, id])
+  @@index([companyId, targetTable, targetRecordId])
+  @@map("attachments")
+}
+
+model AuditLog {
+  id                    String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  companyId             String   @map("company_id") @db.Uuid
+  tableName             String   @map("table_name")
+  recordId              String   @map("record_id") @db.Uuid
+  fieldName             String   @map("field_name")
+  oldValue              String?  @map("old_value")
+  newValue              String?  @map("new_value")
+  changedByMembershipId String   @map("changed_by_membership_id") @db.Uuid
+  changedAt             DateTime @default(now()) @map("changed_at") @db.Timestamptz(6)
+
+  company             Company           @relation(fields: [companyId], references: [id], onDelete: Restrict, onUpdate: Restrict)
+  changedByMembership CompanyMembership @relation("AuditLogChangedBy", fields: [companyId, changedByMembershipId], references: [companyId, id], onDelete: Restrict, onUpdate: Restrict)
+
+  @@unique([companyId, id])
+  @@index([companyId, tableName, recordId])
+  @@map("audit_log")
+}

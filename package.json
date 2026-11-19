@@ -1,0 +1,44 @@
+{
+  "name": "steeltrace",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reinforcement Steel Inventory and Traceability Management System",
+  "license": "UNLICENSED",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prisma:format": "prisma format",
+    "prisma:validate": "prisma validate",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate:dev": "prisma migrate dev",
+    "prisma:studio": "prisma studio",
+    "sql:apply": "tsx --env-file=.env prisma/sql/apply.ts",
+    "db:seed": "tsx --env-file=.env -e \"import('./src/db/bootstrapSql').then(async ({createExecutor})=>{const e=await createExecutor();const {seed}=await import('./src/db/seed');console.log(await seed(e));await e.close();})\"",
+    "test": "tsx --env-file=.env src/db/integrity.test.ts",
+    "test:api": "tsx --env-file=.env src/api/__tests__/task5.test.ts",
+    "test:api:task6": "tsx --env-file=.env src/api/__tests__/task6.test.ts",
+    "start": "tsx --env-file=.env src/api/server.ts"
+  },
+  "dependencies": {
+    "@fastify/multipart": "^10.1.9",
+    "@prisma/client": "^6.1.0",
+    "bcryptjs": "^3.0.3",
+    "exceljs": "^4.4.0",
+    "fastify": "^5.12.8",
+    "jsonwebtoken": "^9.0.3",
+    "pg": "^8.13.1",
+    "qrcode": "^1.5.4",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.16",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "@types/qrcode": "^1.5.6",
+    "prisma": "^6.1.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
